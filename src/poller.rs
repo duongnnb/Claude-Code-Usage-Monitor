@@ -1058,9 +1058,19 @@ fn format_countdown_from_secs(total_secs: u64, strings: Strings) -> String {
     let total_days = total_secs / 86400;
 
     if total_days >= 1 {
-        format!("{total_days}{}", strings.day_suffix)
+        let remaining_hours = (total_secs % 86400) / 3600;
+        if remaining_hours > 0 {
+            format!("{total_days}{}{remaining_hours}{}", strings.day_suffix, strings.hour_suffix)
+        } else {
+            format!("{total_days}{}", strings.day_suffix)
+        }
     } else if total_hours >= 1 {
-        format!("{total_hours}{}", strings.hour_suffix)
+        let remaining_mins = (total_secs % 3600) / 60;
+        if remaining_mins > 0 {
+            format!("{total_hours}{}{remaining_mins}{}", strings.hour_suffix, strings.minute_suffix)
+        } else {
+            format!("{total_hours}{}", strings.hour_suffix)
+        }
     } else if total_mins >= 1 {
         format!("{total_mins}{}", strings.minute_suffix)
     } else {
@@ -1074,9 +1084,9 @@ fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
     let total_days = total_secs / 86400;
 
     let current_bucket_start = if total_days >= 1 {
-        total_days * 86400
-    } else if total_hours >= 1 {
         total_hours * 3600
+    } else if total_hours >= 1 {
+        total_mins * 60
     } else if total_mins >= 1 {
         total_mins * 60
     } else {
