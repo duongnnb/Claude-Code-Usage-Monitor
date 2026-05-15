@@ -43,4 +43,7 @@ pub(super) const STRINGS: Strings = Strings {
     codex_token_expired_body: "請在終端機中執行 'codex'，並依照登入提示操作。完成後，請重新整理或重新啟動此應用程式。",
     codex_window_title: "Codex 使用量監控",
     second_suffix: "秒",
+    format: "格式",
+    format_long: "詳細",
+    format_short: "簡略",
 };

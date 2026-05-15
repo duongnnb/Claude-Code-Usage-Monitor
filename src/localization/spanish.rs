@@ -43,4 +43,7 @@ pub(super) const STRINGS: Strings = Strings {
     codex_token_expired_body: "Ejecuta 'codex' en una terminal y sigue las indicaciones de inicio de sesion. Despues, actualiza o reinicia esta aplicacion.",
     codex_window_title: "Monitor de uso de Codex",
     second_suffix: "s",
+    format: "Formato",
+    format_long: "Largo",
+    format_short: "Corto",
 };

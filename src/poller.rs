@@ -1021,9 +1021,9 @@ fn is_leap(y: u64) -> bool {
 }
 
 /// Format a usage section as "X% · Yh" style text
-pub fn format_line(section: &UsageSection, strings: Strings) -> String {
+pub fn format_line(section: &UsageSection, strings: Strings, compound: bool) -> String {
     let pct = format!("{:.0}%", section.percentage);
-    let cd = format_countdown(section.resets_at, strings);
+    let cd = format_countdown(section.resets_at, strings, compound);
     if cd.is_empty() {
         pct
     } else {
@@ -1031,7 +1031,7 @@ pub fn format_line(section: &UsageSection, strings: Strings) -> String {
     }
 }
 
-fn format_countdown(resets_at: Option<SystemTime>, strings: Strings) -> String {
+fn format_countdown(resets_at: Option<SystemTime>, strings: Strings, compound: bool) -> String {
     let reset = match resets_at {
         Some(t) => t,
         None => return String::new(),
@@ -1042,7 +1042,7 @@ fn format_countdown(resets_at: Option<SystemTime>, strings: Strings) -> String {
         Err(_) => return strings.now.to_string(),
     };
 
-    format_countdown_from_secs(remaining.as_secs(), strings)
+    format_countdown_from_secs(remaining.as_secs(), strings, compound)
 }
 
 /// Calculate how long until the display text would change
@@ -1052,21 +1052,21 @@ pub fn time_until_display_change(resets_at: Option<SystemTime>) -> Option<Durati
     Some(time_until_display_change_from_secs(remaining.as_secs()))
 }
 
-fn format_countdown_from_secs(total_secs: u64, strings: Strings) -> String {
+fn format_countdown_from_secs(total_secs: u64, strings: Strings, compound: bool) -> String {
     let total_mins = total_secs / 60;
     let total_hours = total_secs / 3600;
     let total_days = total_secs / 86400;
 
     if total_days >= 1 {
         let remaining_hours = (total_secs % 86400) / 3600;
-        if remaining_hours > 0 {
+        if compound && remaining_hours > 0 {
             format!("{total_days}{}{remaining_hours}{}", strings.day_suffix, strings.hour_suffix)
         } else {
             format!("{total_days}{}", strings.day_suffix)
         }
     } else if total_hours >= 1 {
         let remaining_mins = (total_secs % 3600) / 60;
-        if remaining_mins > 0 {
+        if compound && remaining_mins > 0 {
             format!("{total_hours}{}{remaining_mins}{}", strings.hour_suffix, strings.minute_suffix)
         } else {
             format!("{total_hours}{}", strings.hour_suffix)

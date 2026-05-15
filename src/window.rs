@@ -69,6 +69,7 @@ struct AppState {
     data: Option<AppUsageData>,
 
     poll_interval_ms: u32,
+    compound_countdown: bool,
     retry_count: u32,
     force_notify_auth_error: bool,
     auth_error_paused_polling: bool,
@@ -121,6 +122,8 @@ const IDM_LANG_KOREAN: u16 = 47;
 const IDM_LANG_TRADITIONAL_CHINESE: u16 = 48;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
+const IDM_FORMAT_LONG: u16 = 70;
+const IDM_FORMAT_SHORT: u16 = 71;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
@@ -203,6 +206,8 @@ struct SettingsFile {
     tray_offset: i32,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
+    #[serde(default = "default_compound_countdown")]
+    compound_countdown: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,6 +225,7 @@ impl Default for SettingsFile {
         Self {
             tray_offset: 0,
             poll_interval_ms: default_poll_interval(),
+            compound_countdown: default_compound_countdown(),
             language: None,
             last_update_check_unix: None,
             widget_visible: true,
@@ -231,6 +237,10 @@ impl Default for SettingsFile {
 
 fn default_poll_interval() -> u32 {
     POLL_15_MIN
+}
+
+fn default_compound_countdown() -> bool {
+    true
 }
 
 fn default_widget_visible() -> bool {
@@ -273,6 +283,7 @@ fn save_state_settings() {
         save_settings(&SettingsFile {
             tray_offset: s.tray_offset,
             poll_interval_ms: s.poll_interval_ms,
+            compound_countdown: s.compound_countdown,
             language: s
                 .language_override
                 .map(|language| language.code().to_string()),
@@ -417,17 +428,19 @@ fn refresh_usage_texts(state: &mut AppState) {
         return;
     };
 
+    let compound = state.compound_countdown;
+
     if let Some(claude_code) = data.claude_code.as_ref() {
-        state.session_text = poller::format_line(&claude_code.session, strings);
-        state.weekly_text = poller::format_line(&claude_code.weekly, strings);
+        state.session_text = poller::format_line(&claude_code.session, strings, compound);
+        state.weekly_text = poller::format_line(&claude_code.weekly, strings, compound);
     } else if state.show_claude_code {
         state.session_text = "!".to_string();
         state.weekly_text = "!".to_string();
     }
 
     if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text = poller::format_line(&codex.session, strings);
-        state.codex_weekly_text = poller::format_line(&codex.weekly, strings);
+        state.codex_session_text = poller::format_line(&codex.session, strings, compound);
+        state.codex_weekly_text = poller::format_line(&codex.weekly, strings, compound);
     } else if state.show_codex {
         state.codex_session_text = "!".to_string();
         state.codex_weekly_text = "!".to_string();
@@ -815,7 +828,7 @@ const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 62;
+const TEXT_WIDTH: i32 = 70;
 const MODEL_RIGHT_MARGIN: i32 = 5;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
@@ -1015,6 +1028,7 @@ pub fn run() {
                 show_codex: settings.show_codex,
                 data: None,
                 poll_interval_ms: settings.poll_interval_ms,
+                compound_countdown: settings.compound_countdown,
                 retry_count: 0,
                 force_notify_auth_error: false,
                 auth_error_paused_polling: false,
@@ -2218,6 +2232,18 @@ unsafe extern "system" fn wnd_proc(
                     // Reset the poll timer with the new interval
                     SetTimer(hwnd, TIMER_POLL, new_interval, None);
                 }
+                IDM_FORMAT_LONG | IDM_FORMAT_SHORT => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.compound_countdown = id == IDM_FORMAT_LONG;
+                            refresh_usage_texts(s);
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                    schedule_countdown_timer();
+                }
                 IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX => {
                     {
                         let mut state = lock_state();
@@ -2319,6 +2345,7 @@ fn show_context_menu(hwnd: HWND) {
     unsafe {
         let (
             current_interval,
+            compound_countdown,
             strings,
             language,
             language_override,
@@ -2332,6 +2359,7 @@ fn show_context_menu(hwnd: HWND) {
             match state.as_ref() {
                 Some(s) => (
                     s.poll_interval_ms,
+                    s.compound_countdown,
                     s.language.strings(),
                     s.language,
                     s.language_override,
@@ -2343,6 +2371,7 @@ fn show_context_menu(hwnd: HWND) {
                 ),
                 None => (
                     POLL_15_MIN,
+                    true,
                     LanguageId::English.strings(),
                     LanguageId::English,
                     None,
@@ -2363,6 +2392,34 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0),
             1,
             PCWSTR::from_raw(refresh_str.as_ptr()),
+        );
+
+        // Format submenu
+        let format_menu = CreatePopupMenu().unwrap();
+        let format_items: [(u16, bool, &str); 2] = [
+            (IDM_FORMAT_LONG, true, strings.format_long),
+            (IDM_FORMAT_SHORT, false, strings.format_short),
+        ];
+        for (id, is_compound, label) in format_items {
+            let flags = if compound_countdown == is_compound {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let label_str = native_interop::wide_str(label);
+            let _ = AppendMenuW(
+                format_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let format_label = native_interop::wide_str(strings.format);
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            format_menu.0 as usize,
+            PCWSTR::from_raw(format_label.as_ptr()),
         );
 
         // Update Frequency submenu
