@@ -12,7 +12,9 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TRACKMOUSEEVENT, TRACKMOUSEEVENT_FLAGS,
+};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -85,6 +87,9 @@ struct AppState {
     drag_start_offset: i32,
 
     widget_visible: bool,
+    popup_hwnd: Option<HWND>,
+    popup_text: String,
+    mouse_over_widget: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +134,9 @@ const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
+
+const TME_LEAVE: TRACKMOUSEEVENT_FLAGS = TRACKMOUSEEVENT_FLAGS(0x00000002);
+const WM_MOUSELEAVE: u32 = 0x02A3;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
@@ -301,26 +309,36 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
         Some(s) if s.last_poll_ok => {
             let mut icons = Vec::new();
             if s.show_claude_code {
+                let reset_line = s.data.as_ref()
+                    .and_then(|d| d.claude_code.as_ref())
+                    .map(|u| reset_tooltip_suffix(u.session.resets_at, u.weekly.resets_at))
+                    .unwrap_or_default();
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Claude,
                     percent: Some(s.session_percent),
                     tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
+                        "{} 5h: {} | 7d: {}{}",
                         s.language.strings().claude_code_model,
                         s.session_text,
-                        s.weekly_text
+                        s.weekly_text,
+                        reset_line
                     ),
                 });
             }
             if s.show_codex {
+                let reset_line = s.data.as_ref()
+                    .and_then(|d| d.codex.as_ref())
+                    .map(|u| reset_tooltip_suffix(u.session.resets_at, u.weekly.resets_at))
+                    .unwrap_or_default();
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Codex,
                     percent: Some(s.codex_session_percent),
                     tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
+                        "{} 5h: {} | 7d: {}{}",
                         s.language.strings().codex_model,
                         s.codex_session_text,
-                        s.codex_weekly_text
+                        s.codex_weekly_text,
+                        reset_line
                     ),
                 });
             }
@@ -903,6 +921,189 @@ fn codex_usage_text_color(is_dark: bool) -> Color {
     }
 }
 
+const POPUP_CLASS: &str = "ClaudeCodeUsagePopup";
+const POPUP_PAD_X: i32 = 6;
+const POPUP_PAD_Y: i32 = 4;
+
+unsafe fn tooltip_font() -> HFONT {
+    let mut ncm = NONCLIENTMETRICSW {
+        cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
+        ..Default::default()
+    };
+    let _ = SystemParametersInfoW(
+        SPI_GETNONCLIENTMETRICS,
+        ncm.cbSize,
+        Some((&mut ncm as *mut NONCLIENTMETRICSW).cast()),
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+    );
+    CreateFontIndirectW(&ncm.lfStatusFont)
+}
+
+unsafe extern "system" fn popup_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+
+            let text = {
+                let state = lock_state();
+                state.as_ref().map(|s| s.popup_text.clone()).unwrap_or_default()
+            };
+
+            let br = CreateSolidBrush(COLORREF(0x00FFFFFF));
+            FillRect(hdc, &rc, br);
+            let _ = DeleteObject(br);
+            FrameRect(hdc, &rc, GetSysColorBrush(COLOR_WINDOWFRAME));
+
+            if !text.is_empty() {
+                let hfont = tooltip_font();
+                let old_font = SelectObject(hdc, hfont);
+                let _ = SetBkMode(hdc, TRANSPARENT);
+                let _ = SetTextColor(hdc, COLORREF(GetSysColor(COLOR_INFOTEXT)));
+                let mut text_rc = RECT {
+                    left: rc.left + POPUP_PAD_X,
+                    top: rc.top + POPUP_PAD_Y,
+                    right: rc.right - POPUP_PAD_X,
+                    bottom: rc.bottom - POPUP_PAD_Y,
+                };
+                let mut wide: Vec<u16> = text.encode_utf16().collect();
+                let _ = DrawTextW(hdc, &mut wide, &mut text_rc, DT_LEFT | DT_TOP | DT_WORDBREAK);
+                SelectObject(hdc, old_font);
+                let _ = DeleteObject(hfont);
+            }
+
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn create_hover_popup(hinstance: windows::Win32::Foundation::HMODULE) -> Option<HWND> {
+    unsafe {
+        let class_name = native_interop::wide_str(POPUP_CLASS);
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(popup_wnd_proc),
+            hInstance: HINSTANCE(hinstance.0),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
+            lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
+            ..Default::default()
+        };
+        RegisterClassExW(&wc);
+
+        CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            PCWSTR::from_raw(class_name.as_ptr()),
+            PCWSTR::null(),
+            WS_POPUP,
+            0,
+            0,
+            10,
+            10,
+            HWND::default(),
+            HMENU::default(),
+            HINSTANCE(hinstance.0),
+            None,
+        )
+        .ok()
+    }
+}
+
+fn reset_tooltip_suffix(session: Option<SystemTime>, weekly: Option<SystemTime>) -> String {
+    let t1 = native_interop::format_local_reset_time(session);
+    let t2 = native_interop::format_local_reset_time(weekly);
+    if t1.is_empty() && t2.is_empty() {
+        String::new()
+    } else {
+        format!("\nReset: 5h {t1} / 7d {t2}")
+    }
+}
+
+fn build_popup_text(s: &AppState) -> String {
+    if !s.last_poll_ok {
+        return String::new();
+    }
+    let Some(data) = s.data.as_ref() else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    let mut push = |show: bool, name: &str, session: Option<SystemTime>, weekly: Option<SystemTime>| {
+        if !show { return; }
+        let t1 = native_interop::format_local_reset_time(session);
+        let t2 = native_interop::format_local_reset_time(weekly);
+        if !t1.is_empty() || !t2.is_empty() {
+            lines.push(format!("{name} — 5h resets {t1}  ·  7d resets {t2}"));
+        }
+    };
+    if let Some(cc) = data.claude_code.as_ref() {
+        push(s.show_claude_code, "Claude Code", cc.session.resets_at, cc.weekly.resets_at);
+    }
+    if let Some(codex) = data.codex.as_ref() {
+        push(s.show_codex, "Codex", codex.session.resets_at, codex.weekly.resets_at);
+    }
+    lines.join("\n")
+}
+
+fn show_hover_popup(widget_hwnd: HWND) {
+    let (popup_hwnd, text) = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else { return };
+        let text = build_popup_text(s);
+        s.popup_text = text.clone();
+        (s.popup_hwnd, text)
+    };
+    let Some(popup) = popup_hwnd else { return };
+    if text.is_empty() {
+        return;
+    }
+
+    let (text_w, text_h) = unsafe {
+        let screen_dc = GetDC(HWND::default());
+        let hfont = tooltip_font();
+        let old_font = SelectObject(screen_dc, hfont);
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        let mut measure_rc = RECT { left: 0, top: 0, right: sc(500), bottom: sc(200) };
+        let _ = DrawTextW(screen_dc, &mut wide, &mut measure_rc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_CALCRECT);
+        SelectObject(screen_dc, old_font);
+        let _ = DeleteObject(hfont);
+        ReleaseDC(HWND::default(), screen_dc);
+        (measure_rc.right - measure_rc.left, measure_rc.bottom - measure_rc.top)
+    };
+
+    let Some(widget_rect) = native_interop::get_window_rect_safe(widget_hwnd) else { return };
+    let popup_w = text_w + POPUP_PAD_X * 2;
+    let popup_h = text_h + POPUP_PAD_Y * 2;
+    let x = (widget_rect.right - popup_w).max(0);
+    let y = widget_rect.top - popup_h - sc(4);
+
+    unsafe {
+        let _ = SetWindowPos(popup, HWND_TOPMOST, x, y, popup_w, popup_h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        let _ = InvalidateRect(popup, None, true);
+    }
+}
+
+fn hide_hover_popup() {
+    let popup = {
+        let state = lock_state();
+        state.as_ref().and_then(|s| s.popup_hwnd)
+    };
+    if let Some(popup) = popup {
+        unsafe {
+            let _ = ShowWindow(popup, SW_HIDE);
+        }
+    }
+}
+
 pub fn run() {
     // Enable Per-Monitor DPI Awareness V2 for crisp rendering at any scale factor
     unsafe {
@@ -1042,6 +1243,9 @@ pub fn run() {
                 drag_start_mouse_x: 0,
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
+                popup_hwnd: None,
+                popup_text: String::new(),
+                mouse_over_widget: false,
             });
         }
 
@@ -1090,6 +1294,15 @@ pub fn run() {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
+        }
+
+        // Create hover popup window
+        let popup = create_hover_popup(hinstance);
+        {
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                s.popup_hwnd = popup;
+            }
         }
 
         // Register system tray icon(s)
@@ -2112,6 +2325,34 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
             }
+            let should_show = lock_state().as_mut().map_or(false, |s| {
+                if !s.dragging && !s.mouse_over_widget {
+                    s.mouse_over_widget = true;
+                    true
+                } else {
+                    false
+                }
+            });
+            if should_show {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
+                show_hover_popup(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            {
+                let mut state = lock_state();
+                if let Some(s) = state.as_mut() {
+                    s.mouse_over_widget = false;
+                }
+            }
+            hide_hover_popup();
             LRESULT(0)
         }
         WM_LBUTTONUP => {
