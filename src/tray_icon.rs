@@ -11,7 +11,6 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::native_interop::{self, Color, WM_APP_TRAY};
 
 const CLAUDE_TRAY_ICON_ID: u32 = 1;
-const CODEX_TRAY_ICON_ID: u32 = 2;
 
 /// Menu item ID for toggling widget visibility (used by window.rs context menu).
 pub const IDM_TOGGLE_WIDGET: u16 = 50;
@@ -26,7 +25,6 @@ pub enum TrayAction {
 #[derive(Clone, Copy)]
 pub enum TrayIconKind {
     Claude,
-    Codex,
 }
 
 pub struct TrayIconData {
@@ -39,7 +37,6 @@ impl TrayIconKind {
     fn id(self) -> u32 {
         match self {
             Self::Claude => CLAUDE_TRAY_ICON_ID,
-            Self::Codex => CODEX_TRAY_ICON_ID,
         }
     }
 }
@@ -82,19 +79,10 @@ fn interpolated_fill(percent: f64) -> Color {
     stops[stops.len() - 1].1
 }
 
-fn codex_fill(percent: f64) -> Color {
-    if percent >= 90.0 {
-        Color::from_hex("#FFFFFF")
-    } else {
-        Color::from_hex("#111111")
-    }
-}
-
 /// Create a rounded-rectangle tray icon badge showing the usage percentage.
-/// For Claude, `percent` = None uses the embedded app icon as the loading state.
-/// For Codex, `percent` = None uses a black/white Codex placeholder badge.
+/// `percent` = None uses the embedded app icon as the loading state.
 pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
-    if matches!(kind, TrayIconKind::Claude) && percent.is_none() {
+    if percent.is_none() {
         let app_icon = load_embedded_app_icon();
         if !app_icon.is_invalid() {
             return app_icon;
@@ -104,34 +92,18 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
     let size = 64_i32;
     let margin = 0_i32;
     let radius = 2_i32;
-    let outline = if matches!(kind, TrayIconKind::Codex) {
-        3_i32
-    } else {
-        0_i32
-    };
+    let outline = 0_i32;
 
-    let fill = match kind {
-        TrayIconKind::Claude => interpolated_fill(percent.unwrap_or(0.0)),
-        TrayIconKind::Codex => codex_fill(percent.unwrap_or(0.0)),
-    };
-    let text_col = match kind {
-        TrayIconKind::Claude => Color::from_hex("#FFFFFF"),
-        TrayIconKind::Codex if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#111111"),
-        TrayIconKind::Codex => Color::from_hex("#FFFFFF"),
-    };
-    let outline_col = match kind {
-        TrayIconKind::Claude => fill,
-        TrayIconKind::Codex if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#111111"),
-        TrayIconKind::Codex => Color::from_hex("#FFFFFF"),
-    };
+    let fill = interpolated_fill(percent.unwrap_or(0.0));
+    let text_col = Color::from_hex("#FFFFFF");
+    let outline_col = fill;
 
     let display_text = match percent {
         Some(p) => format!("{}", p.round().clamp(0.0, 999.0) as u32),
-        None => match kind {
-            TrayIconKind::Claude => String::new(),
-            TrayIconKind::Codex => "C".to_string(),
-        },
+        None => String::new(),
     };
+
+    let _ = kind;
 
     let font_h = match display_text.len() {
         1 => -50,
@@ -394,9 +366,6 @@ pub fn sync(hwnd: HWND, icons: &[TrayIconData]) {
     let show_claude = icons
         .iter()
         .find(|icon| matches!(icon.kind, TrayIconKind::Claude));
-    let show_codex = icons
-        .iter()
-        .find(|icon| matches!(icon.kind, TrayIconKind::Codex));
 
     if let Some(icon) = show_claude {
         add(hwnd, icon.kind, icon.percent, &icon.tooltip);
@@ -404,18 +373,10 @@ pub fn sync(hwnd: HWND, icons: &[TrayIconData]) {
     } else {
         remove(hwnd, TrayIconKind::Claude);
     }
-
-    if let Some(icon) = show_codex {
-        add(hwnd, icon.kind, icon.percent, &icon.tooltip);
-        update(hwnd, icon.kind, icon.percent, &icon.tooltip);
-    } else {
-        remove(hwnd, TrayIconKind::Codex);
-    }
 }
 
 pub fn remove_all(hwnd: HWND) {
     remove(hwnd, TrayIconKind::Claude);
-    remove(hwnd, TrayIconKind::Codex);
 }
 
 /// Interpret a tray callback message and return the action to take.

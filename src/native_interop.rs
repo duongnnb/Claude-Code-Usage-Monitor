@@ -21,6 +21,7 @@ pub const TIMER_POLL: usize = 1;
 pub const TIMER_COUNTDOWN: usize = 2;
 pub const TIMER_RESET_POLL: usize = 3;
 pub const TIMER_UPDATE_CHECK: usize = 4;
+pub const TIMER_PANEL_SHIMMER: usize = 5;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
@@ -149,9 +150,10 @@ pub fn wide_str(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Format a reset SystemTime as local clock time: "3:45 PM" if today, "Mon 3:45 PM" otherwise.
+/// Format a reset SystemTime as local clock time, e.g. "3:45 PM".
+/// Pass `with_day = true` to prefix the abbreviated weekday, e.g. "Mon 3:45 PM".
 /// Returns an empty string if resets_at is None.
-pub fn format_local_reset_time(resets_at: Option<SystemTime>) -> String {
+pub fn format_local_reset_time(resets_at: Option<SystemTime>, with_day: bool) -> String {
     let Some(reset) = resets_at else {
         return String::new();
     };
@@ -160,25 +162,15 @@ pub fn format_local_reset_time(resets_at: Option<SystemTime>) -> String {
     };
     let unix_secs = dur.as_secs() as i64;
 
-    let (bias_total, today_days) = unsafe {
+    let bias_total = unsafe {
         let mut tz = TIME_ZONE_INFORMATION::default();
         let result = GetTimeZoneInformation(&mut tz);
-        // TIME_ZONE_ID_STANDARD=1, TIME_ZONE_ID_DAYLIGHT=2
         let extra = match result {
             2 => tz.DaylightBias,
             1 => tz.StandardBias,
             _ => 0,
         };
-        let bias = tz.Bias + extra;
-
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let now_local = now_unix - bias as i64 * 60;
-        let today = now_local.max(0) as u64 / 86400;
-
-        (bias, today)
+        tz.Bias + extra
     };
 
     let local_secs = (unix_secs - bias_total as i64 * 60).max(0) as u64;
@@ -187,20 +179,16 @@ pub fn format_local_reset_time(resets_at: Option<SystemTime>) -> String {
     let min = ((day_secs % 3600) / 60) as u32;
     let total_days = local_secs / 86400;
 
-    let am_pm = if hour < 12 { "AM" } else { "PM" };
-    let dh = match hour % 12 {
-        0 => 12,
-        x => x,
-    };
+    let am_pm = if hour < 12 { "am" } else { "pm" };
+    let dh = match hour % 12 { 0 => 12, x => x };
     let time_str = format!("{dh}:{min:02} {am_pm}");
 
-    if total_days == today_days {
-        time_str
-    } else {
+    if with_day {
         const DAYS: &[&str] = &["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-        // Jan 1, 1970 was a Thursday (index 4)
-        let dow = ((total_days + 4) % 7) as usize;
+        let dow = ((total_days + 4) % 7) as usize; // Jan 1 1970 = Thursday
         format!("{} {}", DAYS[dow], time_str)
+    } else {
+        time_str
     }
 }
 

@@ -11,7 +11,7 @@ use crate::models::{AppUsageData, UsageData, UsageSection};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
-const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-3-haiku-20240307", "claude-haiku-4-5-20251001"];
@@ -44,50 +44,14 @@ struct UsageBucket {
     resets_at: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct CodexAuthFile {
-    tokens: Option<CodexTokenData>,
-}
-
-#[derive(Clone, Deserialize)]
-struct CodexTokenData {
-    access_token: String,
-    account_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct CodexUsageResponse {
-    rate_limit: Option<Option<Box<CodexRateLimitDetails>>>,
-}
-
-#[derive(Deserialize)]
-struct CodexRateLimitDetails {
-    primary_window: Option<Option<Box<CodexRateLimitWindow>>>,
-    secondary_window: Option<Option<Box<CodexRateLimitWindow>>>,
-}
-
-#[derive(Deserialize)]
-struct CodexRateLimitWindow {
-    used_percent: f64,
-    reset_at: i64,
-}
-
-pub fn poll(show_claude_code: bool, show_codex: bool) -> Result<AppUsageData, PollError> {
+pub fn poll(show_claude_code: bool) -> Result<AppUsageData, PollError> {
     let mut data = AppUsageData::default();
 
     if show_claude_code {
         data.claude_code = Some(poll_claude_code()?);
     }
 
-    if show_codex {
-        match poll_codex() {
-            Ok(codex) => data.codex = Some(codex),
-            Err(error) if !show_claude_code => return Err(error),
-            Err(error) => diagnose::log(format!("Codex usage poll failed: {error:?}")),
-        }
-    }
-
-    if data.claude_code.is_none() && data.codex.is_none() {
+    if data.claude_code.is_none() {
         Err(PollError::RequestFailed)
     } else {
         Ok(data)
@@ -104,28 +68,19 @@ fn poll_claude_code() -> Result<UsageData, PollError> {
     };
 
     let creds = refresh_or_fallback(creds)?;
+    let user_label = creds.subscription_type.clone();
 
-    fetch_usage_with_fallback(&creds.access_token)
-}
-
-fn poll_codex() -> Result<UsageData, PollError> {
-    let creds = match read_codex_credentials() {
-        Some(creds) => creds,
-        None => {
-            diagnose::log("Codex usage poll failed: no Codex credentials found");
-            return Err(PollError::NoCredentials);
+    let email = fetch_profile_email(&creds.access_token);
+    fetch_usage_with_fallback(&creds.access_token).map(|mut data| {
+        data.user_label = user_label;
+        data.email = email;
+        let (msgs, tokens) = read_local_session_counts(data.session.resets_at);
+        if msgs > 0 || tokens > 0 {
+            data.session.message_count = Some(msgs);
+            data.session.token_count   = Some(tokens);
         }
-    };
-
-    match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
-        Ok(data) => Ok(data),
-        Err(PollError::AuthRequired) => {
-            cli_refresh_codex_token();
-            let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
-            fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())
-        }
-        Err(error) => Err(error),
-    }
+        data
+    })
 }
 
 fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
@@ -242,50 +197,6 @@ fn cli_refresh_wsl_token(distro: &str) {
     wait_for_refresh(&mut child);
 }
 
-fn cli_refresh_codex_token() {
-    let codex_path = resolve_windows_codex_path();
-    let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
-    let is_ps1 = codex_path.to_lowercase().ends_with(".ps1");
-    diagnose::log(format!(
-        "attempting Windows Codex token refresh via {codex_path}"
-    ));
-
-    let args: &[&str] = &["exec", "."];
-
-    let mut cmd = if is_cmd {
-        let mut c = Command::new("cmd.exe");
-        c.arg("/c").arg(&codex_path).args(args);
-        c
-    } else if is_ps1 {
-        let mut c = Command::new("powershell.exe");
-        c.arg("-NoProfile")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-File")
-            .arg(&codex_path)
-            .args(args);
-        c
-    } else {
-        let mut c = Command::new(&codex_path);
-        c.args(args);
-        c
-    };
-    cmd.creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(error) => {
-            diagnose::log_error("unable to spawn Windows Codex token refresh", error);
-            return;
-        }
-    };
-
-    wait_for_refresh(&mut child);
-}
-
 /// Spawn a command and wait up to `timeout` for it to finish.
 /// Returns None if the process fails to start or exceeds the deadline.
 fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
@@ -359,41 +270,6 @@ fn resolve_windows_claude_path() -> String {
     }
 
     "claude.cmd".to_string()
-}
-
-fn resolve_windows_codex_path() -> String {
-    for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return name.to_string();
-        }
-    }
-
-    for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = first_line.trim().to_string();
-                    if !path.is_empty() {
-                        return path;
-                    }
-                }
-            }
-        }
-    }
-
-    "codex.cmd".to_string()
 }
 
 fn build_agent() -> Result<ureq::Agent, PollError> {
@@ -636,64 +512,6 @@ fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
     data
 }
 
-fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData, PollError> {
-    let agent = build_agent()?;
-    let mut request = agent
-        .get(CODEX_USAGE_URL)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("User-Agent", "codex-cli");
-
-    if let Some(account_id) = account_id.filter(|value| !value.is_empty()) {
-        request = request.set("ChatGPT-Account-Id", account_id);
-    }
-
-    let resp = match request.call() {
-        Ok(resp) => resp,
-        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-            diagnose::log(format!(
-                "Codex usage endpoint returned auth error status {code}; refresh required"
-            ));
-            return Err(PollError::AuthRequired);
-        }
-        Err(error) => {
-            diagnose::log_error("Codex usage endpoint request failed", error);
-            return Err(PollError::RequestFailed);
-        }
-    };
-
-    let response: CodexUsageResponse = match resp.into_json() {
-        Ok(response) => response,
-        Err(error) => {
-            diagnose::log_error("unable to parse Codex usage response", error);
-            return Err(PollError::RequestFailed);
-        }
-    };
-
-    codex_usage_from_response(response).ok_or(PollError::RequestFailed)
-}
-
-fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> {
-    let details = *response.rate_limit.flatten()?;
-    let mut data = UsageData::default();
-
-    if let Some(window) = details.primary_window.flatten() {
-        data.session = codex_section_from_window(&window);
-    }
-
-    if let Some(window) = details.secondary_window.flatten() {
-        data.weekly = codex_section_from_window(&window);
-    }
-
-    Some(data)
-}
-
-fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
-    UsageSection {
-        percentage: window.used_percent,
-        resets_at: unix_to_system_time(Some(window.reset_at)),
-    }
-}
-
 fn get_header_f64(response: &ureq::Response, name: &str) -> f64 {
     response
         .header(name)
@@ -717,6 +535,7 @@ struct Credentials {
     access_token: String,
     expires_at: Option<i64>,
     source: CredentialSource,
+    subscription_type: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -771,34 +590,6 @@ fn read_credentials_from_source(source: &CredentialSource) -> Option<Credentials
     }
 }
 
-fn codex_auth_path() -> Option<PathBuf> {
-    if let Some(codex_home) = std::env::var_os("CODEX_HOME").map(PathBuf::from) {
-        return Some(codex_home.join("auth.json"));
-    }
-
-    Some(dirs::home_dir()?.join(".codex").join("auth.json"))
-}
-
-fn read_codex_credentials() -> Option<CodexTokenData> {
-    let auth_path = codex_auth_path()?;
-    let content = match std::fs::read_to_string(&auth_path) {
-        Ok(content) => content,
-        Err(error) => {
-            diagnose::log_error(
-                &format!(
-                    "unable to read Codex credentials at {}",
-                    auth_path.display()
-                ),
-                error,
-            );
-            return None;
-        }
-    };
-
-    let auth: CodexAuthFile = serde_json::from_str(&content).ok()?;
-    auth.tokens.filter(|tokens| !tokens.access_token.is_empty())
-}
-
 fn read_wsl_credentials(distro: &str) -> Option<Credentials> {
     let output = run_with_timeout(
         Command::new("wsl.exe")
@@ -840,12 +631,25 @@ fn parse_credentials(content: &str, source: CredentialSource) -> Option<Credenti
         .and_then(|v| v.as_str())?
         .to_string();
     let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64());
+    let subscription_type = oauth
+        .get("subscriptionType")
+        .and_then(|v| v.as_str())
+        .map(capitalize_first);
 
     Some(Credentials {
         access_token,
         expires_at,
         source,
+        subscription_type,
     })
+}
+
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
 }
 
 fn read_next_credentials_after(source: &CredentialSource) -> Option<Credentials> {
@@ -1031,7 +835,7 @@ pub fn format_line(section: &UsageSection, strings: Strings, compound: bool) -> 
     }
 }
 
-fn format_countdown(resets_at: Option<SystemTime>, strings: Strings, compound: bool) -> String {
+pub fn format_countdown(resets_at: Option<SystemTime>, strings: Strings, compound: bool) -> String {
     let reset = match resets_at {
         Some(t) => t,
         None => return String::new(),
@@ -1060,14 +864,20 @@ fn format_countdown_from_secs(total_secs: u64, strings: Strings, compound: bool)
     if total_days >= 1 {
         let remaining_hours = (total_secs % 86400) / 3600;
         if compound && remaining_hours > 0 {
-            format!("{total_days}{}{remaining_hours}{}", strings.day_suffix, strings.hour_suffix)
+            format!(
+                "{total_days}{}{remaining_hours}{}",
+                strings.day_suffix, strings.hour_suffix
+            )
         } else {
             format!("{total_days}{}", strings.day_suffix)
         }
     } else if total_hours >= 1 {
         let remaining_mins = (total_secs % 3600) / 60;
         if compound && remaining_mins > 0 {
-            format!("{total_hours}{}{remaining_mins}{}", strings.hour_suffix, strings.minute_suffix)
+            format!(
+                "{total_hours}{}{remaining_mins}{}",
+                strings.hour_suffix, strings.minute_suffix
+            )
         } else {
             format!("{total_hours}{}", strings.hour_suffix)
         }
@@ -1105,5 +915,88 @@ pub fn is_past_reset(data: &UsageData) -> bool {
 
 pub fn app_is_past_reset(data: &AppUsageData) -> bool {
     data.claude_code.as_ref().is_some_and(is_past_reset)
-        || data.codex.as_ref().is_some_and(is_past_reset)
+}
+
+/// Walk `~/.claude/projects/**/*.jsonl` and count assistant messages + tokens
+/// that fall within the current 5-hour billing window ending at `resets_at`.
+fn fetch_profile_email(token: &str) -> Option<String> {
+    let url = PROFILE_URL;
+    let output = Command::new("curl")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args([
+            "-sf", url,
+            "-H", &format!("Authorization: Bearer {token}"),
+        ])
+        .output()
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    v["account"]["email"].as_str().map(|s| s.to_string())
+}
+
+fn read_local_session_counts(resets_at: Option<SystemTime>) -> (u32, u64) {
+    let resets_at = match resets_at {
+        Some(t) => t,
+        None => return (0, 0),
+    };
+    let window_start = resets_at.checked_sub(Duration::from_secs(5 * 3600))
+        .unwrap_or(UNIX_EPOCH);
+
+    let projects_dir = match dirs::home_dir() {
+        Some(h) => h.join(".claude").join("projects"),
+        None => return (0, 0),
+    };
+    if !projects_dir.exists() {
+        return (0, 0);
+    }
+
+    let mut messages: u32 = 0;
+    let mut tokens:   u64 = 0;
+
+    // projects/<project>/<session-uuid>.jsonl  (each session is a flat file)
+    let project_dirs = match std::fs::read_dir(&projects_dir) {
+        Ok(d) => d, Err(_) => return (0, 0),
+    };
+    for project in project_dirs.flatten() {
+        if !project.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+        let files = match std::fs::read_dir(project.path()) {
+            Ok(d) => d, Err(_) => continue,
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+            scan_jsonl(&path, window_start, resets_at, &mut messages, &mut tokens);
+        }
+    }
+
+    (messages, tokens)
+}
+
+fn scan_jsonl(
+    path: &std::path::Path,
+    window_start: SystemTime,
+    window_end: SystemTime,
+    messages: &mut u32,
+    tokens: &mut u64,
+) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c, Err(_) => return,
+    };
+    for line in content.lines() {
+        if !line.contains(r#""usage""#) { continue; }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v, Err(_) => continue,
+        };
+        // Filter by timestamp
+        let ts = match parse_iso8601(v["timestamp"].as_str()) {
+            Some(t) => t, None => continue,
+        };
+        if ts < window_start || ts >= window_end { continue; }
+        // Only assistant turns carry usage we want to count
+        if v["message"]["role"].as_str() != Some("assistant") { continue; }
+        let usage = &v["message"]["usage"];
+        let inp = usage["input_tokens"].as_u64().unwrap_or(0);
+        let out = usage["output_tokens"].as_u64().unwrap_or(0);
+        *messages += 1;
+        *tokens   += inp + out;
+    }
 }

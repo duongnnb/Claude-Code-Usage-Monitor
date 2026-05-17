@@ -120,6 +120,7 @@ impl LanguageId {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub struct Strings {
     pub window_title: &'static str,
     pub refresh: &'static str,
@@ -130,7 +131,6 @@ pub struct Strings {
     pub one_hour: &'static str,
     pub models: &'static str,
     pub claude_code_model: &'static str,
-    pub codex_model: &'static str,
     pub settings: &'static str,
     pub start_with_windows: &'static str,
     pub reset_position: &'static str,
@@ -158,12 +158,24 @@ pub struct Strings {
     pub second_suffix: &'static str,
     pub token_expired_title: &'static str,
     pub token_expired_body: &'static str,
-    pub codex_token_expired_title: &'static str,
-    pub codex_token_expired_body: &'static str,
-    pub codex_window_title: &'static str,
     pub format: &'static str,
     pub format_long: &'static str,
     pub format_short: &'static str,
+    pub panel_waiting_for_data: &'static str,
+    pub panel_resets: &'static str,
+    pub panel_status_normal: &'static str,
+    pub panel_status_caution: &'static str,
+    pub panel_status_near_limit: &'static str,
+    pub panel_status_at_limit: &'static str,
+    pub panel_status_unknown: &'static str,
+    pub panel_error_missing_credentials: &'static str,
+    pub panel_error_token_expired: &'static str,
+    pub panel_last_known_data: &'static str,
+    pub panel_retrying: &'static str,
+    pub panel_session_label: &'static str,
+    pub panel_weekly_label: &'static str,
+    pub panel_timer_until_reset: &'static str,
+    pub panel_timer_left_session: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {

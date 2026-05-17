@@ -24,3 +24,6 @@ workflow.cmd
 
 # Local WinGet manifest generation output
 /manifests/
+
+# Claude Code local settings
+.claude/settings.local.json

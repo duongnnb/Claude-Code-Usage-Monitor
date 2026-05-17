@@ -16,9 +16,12 @@ It sits in your taskbar and shows how much of your Claude Code and/or Codex usag
 - Optional Codex usage bars alongside Claude Code
 - A live countdown until each limit resets
 - A small native widget that lives directly in the Windows taskbar
+- **Left-click the widget** to open a detailed usage panel with exact reset times and plan info
 - System tray icon badges showing your enabled model usage percentage
 - Left-click the tray icon to toggle the taskbar widget on or off
 - Right-click options for refresh, displayed models, update frequency, language, startup, and updates
+
+![Panel](docs/panel.png)
 
 ## Who This Is For
 
